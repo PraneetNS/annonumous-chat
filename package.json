@@ -1,0 +1,52 @@
+{
+  "name": "ephemeral-e2ee-chat-ws-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "dev:server": "tsx watch src/index.ts",
+    "dev:web": "concurrently \"next dev -H 0.0.0.0 -p 3002\" \"local-ssl-proxy --hostname 0.0.0.0 --source 3000 --target 3002 --key server/certs/key.pem --cert server/certs/cert.pem\"",
+    "dev:proxy": "node scripts/unified-proxy.js",
+    "dev:tunnel": "node scripts/tunnel-manager.js",
+    "dev:all": "concurrently \"npm run dev\" \"npm run dev:web\" \"npm run dev:proxy\" \"npm run dev:tunnel\"",
+    "start:public": "node scripts/start-with-tunnel.js",
+    "build": "tsc -p tsconfig.server.json",
+    "start": "node dist/server/index.js",
+    "build:web": "next build",
+    "start:web": "next start -H 0.0.0.0 -p 3000"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/websocket": "^11.2.0",
+    "@types/http-proxy": "^1.17.17",
+    "dotenv": "^17.2.4",
+    "fastify": "^5.2.1",
+    "fastify-plugin": "^5.0.1",
+    "http-proxy": "^1.18.1",
+    "ioredis": "^5.4.1",
+    "next": "^15.2.0",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "19.2.13",
+    "@types/selfsigned": "^2.0.4",
+    "@types/ws": "^8.5.14",
+    "concurrently": "^9.2.1",
+    "local-ssl-proxy": "^2.0.5",
+    "redis-server": "^1.2.2",
+    "selfsigned": "^5.5.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

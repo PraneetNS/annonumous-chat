@@ -1,0 +1,6 @@
+{
+    "name": "start-redis",
+    "version": "1.0.0",
+    "type": "module",
+    "main": "start-redis.js"
+}

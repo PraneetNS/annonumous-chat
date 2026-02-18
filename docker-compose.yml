@@ -1,0 +1,138 @@
+version: '3.8'
+
+services:
+  # Redis - In-memory state store
+  redis:
+    image: redis:7-alpine
+    container_name: e2ee-chat-redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - chat-network
+
+  # WebSocket Server
+  chat-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: e2ee-chat-server
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      # Server configuration
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      LOG_REQUESTS: "true"
+      TRUST_PROXY: "true"
+
+      # Redis connection
+      REDIS_URL: redis://redis:6379
+      REDIS_MAX_RETRIES_PER_REQUEST: 3
+      REDIS_ENABLE_READY_CHECK: "true"
+      REDIS_CONNECT_TIMEOUT: 10000
+
+      # Cryptographic secrets (CHANGE IN PRODUCTION!)
+      JOIN_TOKEN_SECRET: ${JOIN_TOKEN_SECRET:-CHANGE_ME_IN_PRODUCTION_MIN_32_BYTES}
+
+      # Room configuration
+      ROOM_MAX_PARTICIPANTS: 10
+      ROOM_KEY_TTL_MS: 600000
+      QR_ROTATION_MS: 60000
+
+      # Message size limits
+      MAX_WS_MSG_BYTES: 262144
+      MAX_APP_CIPHERTEXT_BYTES: 65536
+
+      # Rate limiting
+      MAX_MSGS_PER_10S: 200
+      MAX_BYTES_PER_10S: 1048576
+      MAX_CONNS_PER_IP: 50
+      MAX_TOTAL_CONNECTIONS: 10000
+      MAX_ROOM_CREATES_PER_IP_PER_MIN: 10
+
+      # Feature toggles
+      FEATURE_HEALTH_ENDPOINT: "true"
+      FEATURE_METRICS_ENDPOINT: "true"
+      FEATURE_READINESS_ENDPOINT: "true"
+      FEATURE_GRACEFUL_SHUTDOWN: "true"
+      GRACEFUL_SHUTDOWN_TIMEOUT_MS: 30000
+      FEATURE_DETAILED_ERRORS: "false"
+      FEATURE_CORS: "true"
+      FEATURE_SECURITY_HEADERS: "true"
+      FEATURE_REQUEST_ID: "true"
+
+      # CORS configuration
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      CORS_ALLOW_CREDENTIALS: "true"
+
+      # Security headers
+      CSP_DIRECTIVES: "default-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+      HSTS_MAX_AGE: 31536000
+      HSTS_INCLUDE_SUBDOMAINS: "true"
+      HSTS_PRELOAD: "true"
+
+      # Observability
+      METRICS_EXPORT_PROMETHEUS: "true"
+      METRICS_COLLECTION_INTERVAL_MS: 15000
+
+      # Abuse prevention
+      FEATURE_IP_TRACKING: "true"
+      FEATURE_TOKEN_REPLAY_PROTECTION: "true"
+      FEATURE_SLOW_CONSUMER_PROTECTION: "true"
+      SLOW_CONSUMER_BUFFER_THRESHOLD: 524288
+      FEATURE_AUTO_ROOM_CLEANUP: "true"
+
+      # Performance tuning
+      WS_PING_INTERVAL_MS: 30000
+      WS_PING_TIMEOUT_MS: 5000
+      HTTP_KEEP_ALIVE_TIMEOUT_MS: 65000
+
+      # Monitoring
+      LOG_HEALTH_CHECK_FAILURES: "true"
+      FEATURE_ERROR_ALERTING: "false"
+
+      # Deployment metadata
+      SERVICE_VERSION: 0.1.0
+      DEPLOYMENT_ENV: production
+
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health', (r) => { process.exit(r.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1));"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - chat-network
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  chat-network:
+    driver: bridge
