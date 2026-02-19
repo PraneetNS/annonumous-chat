@@ -10,6 +10,9 @@ import { scanSensitivity } from "../shredder/ai-scanner/scanner";
 import { CamouflageEngine } from "../shredder/security/camouflage";
 import { formatTimeLocked, isReady, TimeLockedPayload } from "../shredder/crypto/timelock";
 
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
+const ACCEPTED_TYPES = "image/jpeg,image/png,image/gif,image/webp,image/avif,image/svg+xml";
+
 // Dynamic Signaling URL based on origin
 const getSignalingUrl = () => {
   if (typeof window === "undefined") return "";
@@ -30,6 +33,7 @@ export default function ShredderPage() {
   const [isPeerTyping, setIsPeerTyping] = useState(false);
   const [sensitivityWarning, setSensitivityWarning] = useState<string[] | null>(null);
   const [isSearchingRandom, setIsSearchingRandom] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   // Core Refs
   const keyPairRef = useRef<CryptoKeyPair | null>(null);
@@ -38,6 +42,8 @@ export default function ShredderPage() {
   const signalingRef = useRef<SignalingClient | null>(null);
   const camouflageRef = useRef<CamouflageEngine | null>(null);
   const currentRoomIdRef = useRef("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const objectUrlsRef = useRef<Set<string>>(new Set());
 
   // 1️⃣ Initialize Session Identity
   useEffect(() => {
@@ -56,8 +62,16 @@ export default function ShredderPage() {
       peerRef.current?.wipe();
       signalingRef.current?.close();
       camouflageRef.current?.stop();
+      revokeAllMedia();
     };
   }, []);
+
+  function revokeAllMedia() {
+    for (const url of objectUrlsRef.current) {
+      URL.revokeObjectURL(url);
+    }
+    objectUrlsRef.current.clear();
+  }
 
   // 2️⃣ Join / Create Room
   async function startSession(explicitRoomId?: string) {
@@ -209,6 +223,16 @@ export default function ShredderPage() {
           setIsPeerTyping(msg.isTyping);
           return;
         }
+        if (msg.type === "image") {
+          // Reconstruct image from P2P data
+          const blob = new Blob([new Uint8Array(Crypto.b64urlDecode(msg.data))], { type: msg.mime });
+          const url = URL.createObjectURL(blob);
+          objectUrlsRef.current.add(url);
+          msg.objectUrl = url;
+          // Security: original data is no longer needed in memory
+          const m = msg as any;
+          delete m.data;
+        }
         setMessages(prev => [...prev, msg]);
         setIsPeerTyping(false);
       }
@@ -262,6 +286,51 @@ export default function ShredderPage() {
     peerRef.current.send(sig);
   }
 
+  async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_IMAGE_BYTES) {
+      auditLog("panic", "File too large (Max 10MB)");
+      return;
+    }
+
+    setUploadProgress(10);
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const arr = new Uint8Array(reader.result as ArrayBuffer);
+      const b64 = Crypto.b64urlEncode(arr.buffer);
+
+      const msg = {
+        id: Math.random().toString(36),
+        type: "image",
+        from: nickName.trim() || identity?.slice(0, 6),
+        mime: file.type,
+        data: b64,
+        ts: Date.now()
+      };
+
+      if (!sharedKeyRef.current || !peerRef.current) return;
+      const activeRoomId = currentRoomIdRef.current;
+
+      setUploadProgress(50);
+      const ct = await Crypto.encrypt(sharedKeyRef.current, JSON.stringify(msg), activeRoomId);
+
+      await camouflageRef.current?.scheduleSend(() => {
+        peerRef.current?.send(ct);
+
+        // Show local preview
+        const localUrl = URL.createObjectURL(file);
+        objectUrlsRef.current.add(localUrl);
+        const localMsg = { ...msg, objectUrl: localUrl } as any;
+        delete localMsg.data;
+
+        setMessages(prev => [...prev, localMsg]);
+        setUploadProgress(null);
+      });
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
   // Handle typing detection
   useEffect(() => {
     if (inputText.length > 0) {
@@ -276,8 +345,8 @@ export default function ShredderPage() {
   function exitChat() {
     auditLog("info", "Exiting chat and wiping session...");
     peerRef.current?.wipe();
-    signalingRef.current?.close();
     camouflageRef.current?.stop();
+    revokeAllMedia();
     setStep("init");
     setMessages([]);
     setPeerState("disconnected");
@@ -431,12 +500,22 @@ export default function ShredderPage() {
                   color: "#ff7b72",
                   fontSize: 11,
                   fontWeight: 600,
-                  cursor: "pointer"
+                  cursor: "pointer",
+                  transition: "all 0.2s"
                 }}
+                onMouseEnter={e => e.currentTarget.style.background = "rgba(255, 123, 114, 0.2)"}
+                onMouseLeave={e => e.currentTarget.style.background = "rgba(255, 123, 114, 0.1)"}
               >
                 Exit Chat
               </button>
             </div>
+
+            {/* Upload progress */}
+            {uploadProgress !== null && (
+              <div style={{ height: 2, background: "rgba(121, 192, 255, 0.1)", borderRadius: 10, marginBottom: 10, overflow: "hidden" }}>
+                <div style={{ height: "100%", background: "#79c0ff", width: `${uploadProgress}%`, transition: "width 0.3s" }} />
+              </div>
+            )}
             {/* Message Area */}
             <div style={{ flex: 1, overflowY: "auto", padding: "8px 0", display: "flex", flexDirection: "column", gap: 12 }}>
               {messages.map(m => (
@@ -458,7 +537,14 @@ export default function ShredderPage() {
                       <span>{m.from}</span>
                       <span>{new Date(m.ts).toLocaleTimeString()}</span>
                     </div>
-                    <div style={{ fontSize: 14, lineHeight: 1.5 }}>{m.text}</div>
+                    {m.type === "image" ? (
+                      <div style={{ borderRadius: 8, overflow: "hidden", border: "1px solid rgba(255,255,255,0.1)", cursor: "pointer" }} onClick={() => window.open(m.objectUrl, '_blank')}>
+                        <img src={m.objectUrl} alt="shared" style={{ maxWidth: "100%", display: "block" }} />
+                        <div style={{ fontSize: 9, padding: "4px 8px", background: "rgba(0,0,0,0.3)", color: "#8b949e" }}>🔒 Encrypted Media</div>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 14, lineHeight: 1.5 }}>{m.text}</div>
+                    )}
                   </div>
                 )
               ))}
@@ -505,7 +591,44 @@ export default function ShredderPage() {
                   <button onClick={() => setSensitivityWarning(null)} style={{ background: "none", border: "0", color: "#58a6ff", cursor: "pointer", fontSize: 10, padding: 0 }}>Ignore and Send</button>
                 </div>
               )}
-              <div style={{ display: "flex", gap: 12 }}>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  accept={ACCEPTED_TYPES}
+                  style={{ display: "none" }}
+                  onChange={handleFile}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  style={{
+                    width: 48,
+                    height: 48,
+                    borderRadius: 14,
+                    border: "1px solid #30363d",
+                    background: "rgba(121, 192, 255, 0.05)",
+                    color: "#79c0ff",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    cursor: "pointer",
+                    flexShrink: 0,
+                    transition: "all 0.2s"
+                  }}
+                  onMouseEnter={e => {
+                    e.currentTarget.style.background = "rgba(121, 192, 255, 0.1)";
+                    e.currentTarget.style.borderColor = "#79c0ff";
+                  }}
+                  onMouseLeave={e => {
+                    e.currentTarget.style.background = "rgba(121, 192, 255, 0.05)";
+                    e.currentTarget.style.borderColor = "#30363d";
+                  }}
+                  title="Share Image"
+                >
+                  <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" />
+                  </svg>
+                </button>
                 <input
                   value={inputText}
                   onChange={e => setInputText(e.target.value)}
@@ -526,13 +649,17 @@ export default function ShredderPage() {
                   onClick={sendMessage}
                   style={{
                     padding: "0 24px",
+                    height: 48,
                     borderRadius: 14,
                     border: "0",
                     background: "#e6edf3",
                     color: "#0b0f14",
                     fontWeight: 700,
-                    cursor: "pointer"
+                    cursor: "pointer",
+                    transition: "all 0.2s"
                   }}
+                  onMouseEnter={e => e.currentTarget.style.transform = "scale(1.02)"}
+                  onMouseLeave={e => e.currentTarget.style.transform = "scale(1)"}
                 >
                   Send
                 </button>
@@ -581,6 +708,6 @@ export default function ShredderPage() {
           }
         }
       `}} />
-    </main>
+    </main >
   );
 }
