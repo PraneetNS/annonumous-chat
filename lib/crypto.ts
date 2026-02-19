@@ -137,3 +137,28 @@ export async function encryptMediaFile(key: CryptoKey, file: File, chunkSize = 2
   return { mime: file.type || "application/octet-stream", size: file.size, chunkSize, chunks };
 }
 
+export async function decryptMediaFile(key: CryptoKey, media: EncryptedMedia): Promise<Blob | null> {
+  try {
+    const parts: Uint8Array[] = [];
+    for (let idx = 0; idx < media.chunks.length; idx++) {
+      const chunkB64 = media.chunks[idx];
+      if (!chunkB64) return null;
+      const buf = b64urlDecode(chunkB64);
+      if (buf.byteLength <= NONCE_BYTES) return null;
+      const nonce = buf.slice(0, NONCE_BYTES);
+      const ct = buf.slice(NONCE_BYTES);
+      const ptBytes = ct.byteLength - 16; // AES-GCM tag is 16 bytes
+      const pt = await getSubtle().decrypt(
+        { name: "AES-GCM", iv: new Uint8Array(nonce), additionalData: new Uint8Array(te.encode(`media:v1|${idx}|${ptBytes}`)) },
+        key,
+        ct
+      );
+      parts.push(new Uint8Array(pt as ArrayBuffer));
+    }
+    return new Blob(parts.map(p => p.buffer as ArrayBuffer), { type: media.mime ?? "application/octet-stream" });
+  } catch {
+    return null; // Authentication failure or corrupt data
+  }
+}
+
+

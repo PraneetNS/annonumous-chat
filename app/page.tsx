@@ -1,354 +1,586 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import QRCode from "qrcode";
-import { b64urlEncode, randomBytes } from "../lib/crypto";
+import { useEffect, useRef, useState, useMemo } from "react";
+import * as Crypto from "../shredder/crypto/crypto";
+import { P2PPeer } from "../shredder/network/webrtc";
+import { SignalingClient, SignalingEvent } from "../shredder/network/signaling-client";
+import { AuditPanel, auditLog } from "../shredder/ui/AuditPanel";
+import { PanicManager } from "../components/PanicManager";
+import { scanSensitivity } from "../shredder/ai-scanner/scanner";
+import { CamouflageEngine } from "../shredder/security/camouflage";
+import { formatTimeLocked, isReady, TimeLockedPayload } from "../shredder/crypto/timelock";
 
-// Dynamic API URL
-const getApiBase = () => {
-  if (process.env.NEXT_PUBLIC_API_BASE) return process.env.NEXT_PUBLIC_API_BASE;
-  if (typeof window === "undefined") return "https://localhost:3001";
-
-  const hostname = window.location.hostname;
-  const port = window.location.port;
-  const protocol = window.location.protocol;
-
-  if (port === "3000" && protocol === "https:") return `https://${hostname}:4001/api`;
-  if (port === "4000" || port === "4001") return "/api";
-  if (hostname.includes("loca.lt") || hostname.includes("ngrok") ||
-    hostname.includes("trycloudflare.com") || hostname.includes("serveo.net")) return "/api";
-  return `https://${hostname}:3001`;
+// Dynamic Signaling URL based on origin
+const getSignalingUrl = () => {
+  if (typeof window === "undefined") return "";
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const host = window.location.host;
+  return `${protocol}//${host}/signaling`;
 };
 
-const API_BASE = getApiBase();
+export default function ShredderPage() {
+  const [step, setStep] = useState<"init" | "joining" | "chat">("init");
+  const [roomId, setRoomId] = useState("");
+  const [identity, setIdentity] = useState<string | null>(null);
+  const [messages, setMessages] = useState<any[]>([]);
+  const [inputText, setInputText] = useState("");
+  const [peerState, setPeerState] = useState<string>("disconnected");
+  const [isLowBandwidth, setIsLowBandwidth] = useState(false);
+  const [nickName, setNickName] = useState("");
+  const [isPeerTyping, setIsPeerTyping] = useState(false);
+  const [sensitivityWarning, setSensitivityWarning] = useState<string[] | null>(null);
+  const [isSearchingRandom, setIsSearchingRandom] = useState(false);
 
-type CreateRoomResp = { roomId: string; fingerprint: string; networkIp?: string };
-type TokenResp = { roomId: string; token: string; expUnixMs: number };
+  // Core Refs
+  const keyPairRef = useRef<CryptoKeyPair | null>(null);
+  const sharedKeyRef = useRef<CryptoKey | null>(null);
+  const peerRef = useRef<P2PPeer | null>(null);
+  const signalingRef = useRef<SignalingClient | null>(null);
+  const camouflageRef = useRef<CamouflageEngine | null>(null);
+  const currentRoomIdRef = useRef("");
 
-/** Detect current access type from window.location */
-function detectAccessType(): "tunnel" | "network" | "localhost" {
-  if (typeof window === "undefined") return "localhost";
-  const h = window.location.hostname;
-  if (h.includes("trycloudflare.com") || h.includes("ngrok") ||
-    h.includes("loca.lt") || h.includes("serveo.net")) return "tunnel";
-  if (h !== "localhost" && h !== "127.0.0.1") return "network";
-  return "localhost";
-}
-
-export default function Page() {
-  const [roomId, setRoomId] = useState<string | null>(null);
-  const [fingerprint, setFingerprint] = useState<string | null>(null);
-  const [token, setToken] = useState<string | null>(null);
-  const [exp, setExp] = useState<number | null>(null);
-  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
-  const [roomSecretB64, setRoomSecretB64] = useState<string | null>(null);
-  const [networkIp, setNetworkIp] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [tunnelUrl, setTunnelUrl] = useState<string | null>(null);
-  const [tunnelChecked, setTunnelChecked] = useState(false);
-  const [urlType, setUrlType] = useState<"tunnel" | "network" | "localhost">("localhost");
-  const tunnelPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // ── Poll for Cloudflare tunnel URL ────────────────────────────────────────
+  // 1️⃣ Initialize Session Identity
   useEffect(() => {
-    const fetchTunnel = async () => {
-      try {
-        const res = await fetch("/api/tunnel-url", { cache: "no-store" });
-        if (res.ok) {
-          const j = await res.json();
-          if (j.tunnelUrl) {
-            setTunnelUrl(j.tunnelUrl);
-          }
-        }
-      } catch { }
-      setTunnelChecked(true);
-    };
-
-    // Poll every 3 seconds until we get a tunnel URL
-    fetchTunnel();
-    tunnelPollRef.current = setInterval(async () => {
-      if (tunnelUrl) {
-        clearInterval(tunnelPollRef.current!);
-        return;
-      }
-      await fetchTunnel();
-    }, 3000);
+    async function init() {
+      auditLog("info", "Initializing GhostWire engine...");
+      const kp = await Crypto.generateSessionKeyPair();
+      keyPairRef.current = kp;
+      const finger = await Crypto.getIdentityFingerprint(kp.publicKey);
+      setIdentity(finger);
+      auditLog("sec", `Session Identity Generated: ${finger.slice(0, 8)}...`);
+    }
+    init();
 
     return () => {
-      if (tunnelPollRef.current) clearInterval(tunnelPollRef.current);
+      // Emergency Cleanup on unmount
+      peerRef.current?.wipe();
+      signalingRef.current?.close();
+      camouflageRef.current?.stop();
     };
-  }, [tunnelUrl]);
+  }, []);
 
-  // ── Build the join URL ─────────────────────────────────────────────────────
-  const joinUrl = useMemo(() => {
-    if (!roomId || !token || !roomSecretB64) return null;
+  // 2️⃣ Join / Create Room
+  async function startSession(explicitRoomId?: string) {
+    const finalRoomId = explicitRoomId || roomId;
+    if (!finalRoomId) return;
+    setRoomId(finalRoomId);
+    currentRoomIdRef.current = finalRoomId;
+    setStep("joining");
+    setIsSearchingRandom(false);
+    auditLog("info", `Connecting to ephemeral room: ${finalRoomId}`);
 
-    let origin: string;
-    let type: "tunnel" | "network" | "localhost";
+    const sigUrl = getSignalingUrl();
+    const sig = new SignalingClient(sigUrl, finalRoomId, (ev) => {
+      handleSignaling(ev);
+    }, () => {
+      auditLog("info", "Connected to signaling hub. Waiting for peer...");
+      setStep("chat");
+    });
+    signalingRef.current = sig;
+    sig.connect();
 
-    const currentType = detectAccessType();
+    // Init WebRTC
+    const peer = new P2PPeer(
+      { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] },
+      handleIncomingData,
+      (candidate) => sig.send({ t: "ICE", roomId: finalRoomId, candidate }),
+      (state) => {
+        setPeerState(state);
+        auditLog("info", `P2P Connection State: ${state}`);
+        if (state === "connected") {
+          setMessages(prev => [...prev, { id: 'sys-' + Date.now(), type: 'system', text: "🔒 Secure P2P Tunnel Established." }]);
+        }
+        if (state === "failed" || state === "closed") {
+          setMessages(prev => [...prev, { id: 'sys-' + Date.now(), type: 'system', text: "❌ Peer left the chat." }]);
+        }
+      }
+    );
+    peerRef.current = peer;
 
-    if (currentType === "tunnel") {
-      // Already on tunnel — use current origin
-      origin = typeof window !== "undefined" ? window.location.origin : "";
-      type = "tunnel";
-    } else if (tunnelUrl) {
-      // Tunnel is running — always prefer it for global access
-      origin = tunnelUrl;
-      type = "tunnel";
-    } else if (networkIp && (typeof window === "undefined" ||
-      window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1")) {
-      // Fall back to local network IP
-      origin = `http://${networkIp}:4000`;
-      type = "network";
-    } else {
-      origin = typeof window !== "undefined" ? window.location.origin : "";
-      type = currentType;
+    // Init Camouflage
+    const camo = new CamouflageEngine(() => {
+      peer.send(new Uint8Array([0, 1, 2, 3]));
+    });
+    camouflageRef.current = camo;
+    camo.startNoiseGenerator();
+
+    setTimeout(async () => {
+      if (peerRef.current?.getSignalingState() === "stable") {
+        auditLog("sec", "Initiating P2P Handshake & Key Exchange...");
+        const jwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
+        sig.send({ t: "PUBKEY", roomId: finalRoomId, jwk });
+
+        const offer = await peer.createOffer();
+        sig.send({ t: "OFFER", roomId: finalRoomId, sdp: offer, from: identity });
+      }
+    }, 1500);
+  }
+
+  async function startRandomSession() {
+    setIsSearchingRandom(true);
+    const sigUrl = getSignalingUrl();
+    const sig = new SignalingClient(sigUrl, "LOBBY", (ev) => {
+      if (ev.t === "MATCH") {
+        auditLog("sec", "Stranger matched! Joining room...");
+        sig.close();
+        startSession(ev.roomId);
+      } else {
+        handleSignaling(ev);
+      }
+    }, () => {
+      // Send random match request as soon as connected to lobby
+      auditLog("info", "Searching for an anonymous peer...");
+      sig.send({ t: "RANDOM" });
+    });
+    signalingRef.current = sig;
+    sig.connect();
+  }
+
+  // 3️⃣ Signaling Handlers
+  async function handleSignaling(ev: SignalingEvent | any) {
+    if (!peerRef.current || !keyPairRef.current) return;
+
+    switch (ev.t) {
+      case "PUBKEY":
+        auditLog("sec", "Received remote public key. Deriving Shared Secret...");
+        const remotePublic = await Crypto.importPublicKey(ev.jwk);
+        sharedKeyRef.current = await Crypto.deriveSharedKey(
+          keyPairRef.current!.privateKey,
+          remotePublic
+        );
+        // If we received their key, send ours back if we haven't yet
+        const myJwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
+        const activeRoomId = currentRoomIdRef.current;
+        signalingRef.current?.send({ t: "PUBKEY", roomId: activeRoomId, jwk: myJwk });
+        break;
+      case "OFFER":
+        const currentSignalingState = peerRef.current.getSignalingState();
+        const offerCollision = currentSignalingState !== "stable";
+
+        // Collision resolution: compare identity hashes (Tie-breaker)
+        // If we are "impolite" (hash > remote), we ignore their offer if it's a collision
+        if (offerCollision && identity! > ev.from) {
+          auditLog("sec", "Offer collision detected. Yielding to polite peer.");
+          return;
+        }
+
+        auditLog("sec", "Received P2P Offer. Deriving Answer...");
+        const answer = await peerRef.current.handleOffer(ev.sdp);
+        const activeRoomIdForAnswer = currentRoomIdRef.current;
+        signalingRef.current?.send({ t: "ANSWER", roomId: activeRoomIdForAnswer, sdp: answer });
+        break;
+      case "ANSWER":
+        if (peerRef.current.getSignalingState() !== "have-local-offer") {
+          auditLog("info", "Received unexpected Answer. Ignoring.");
+          return;
+        }
+        auditLog("sec", "Received P2P Answer. Handshake complete.");
+        await peerRef.current.handleAnswer(ev.sdp);
+        break;
+      case "ICE":
+        await peerRef.current.addCandidate(ev.candidate);
+        break;
+    }
+  }
+
+  // 4️⃣ Data Handlers (Decryption)
+  async function handleIncomingData(data: Uint8Array) {
+    if (data.length <= 4) return; // Ignore noise
+
+    // For this MVP, we use a pre-shared room secret or derive from exchange
+    // Actually, ECDH deriveKey needs the remote public key. 
+    // In a real P2P mesh, we'd exchange public keys during signaling.
+    // Let's assume the roomId is used as a salt for simplicity in this MVP version
+    // while we wait for proper ECDH integration in signaling.
+
+    if (!sharedKeyRef.current) {
+      auditLog("info", "Packet dropped: No shared secret established yet.");
+      return;
     }
 
-    setUrlType(type);
+    // Use Ref to avoid stale state in closure
+    const activeRoomId = currentRoomIdRef.current;
 
-    const u = new URL("/join", origin);
-    u.searchParams.set("roomId", roomId);
-    u.searchParams.set("token", token);
-    u.hash = `k=${roomSecretB64}`;
-    return u.toString();
-  }, [roomId, token, roomSecretB64, networkIp, tunnelUrl]);
-
-  async function refreshToken(rid: string) {
-    const res = await fetch(`${API_BASE}/rooms/${encodeURIComponent(rid)}/token`, { cache: "no-store" });
-    if (!res.ok) throw new Error("token fetch failed");
-    const j = (await res.json()) as TokenResp;
-    setToken(j.token);
-    setExp(j.expUnixMs);
+    try {
+      const pt = await Crypto.decrypt(sharedKeyRef.current!, data, activeRoomId);
+      if (pt) {
+        const msg = JSON.parse(pt);
+        if (msg.type === "typing") {
+          setIsPeerTyping(msg.isTyping);
+          return;
+        }
+        setMessages(prev => [...prev, msg]);
+        setIsPeerTyping(false);
+      }
+    } catch (err) {
+      auditLog("panic", "Decryption failed: Handshake mismatch or room transition error.");
+      console.error("GhostWire Decrypt Error:", err);
+    }
   }
 
-  async function renderQr(url: string) {
-    const dataUrl = await QRCode.toDataURL(url, { margin: 1, width: 260, errorCorrectionLevel: "M" });
-    setQrDataUrl(dataUrl);
-  }
+  // 5️⃣ Outbound Logic (Encryption + Camouflage)
+  async function sendMessage() {
+    if (!inputText.trim() || !peerRef.current) return;
 
-  async function onCreate() {
-    setError(null);
-    setQrDataUrl(null);
-    setRoomId(null);
-    setFingerprint(null);
-    setToken(null);
-    setExp(null);
-    setNetworkIp(null);
+    const scan = scanSensitivity(inputText);
+    if (scan.sensitive && !sensitivityWarning) {
+      setSensitivityWarning(scan.matches);
+      return;
+    }
 
-    const secret = randomBytes(32);
-    setRoomSecretB64(b64urlEncode(secret.buffer));
-
-    const res = await fetch(`${API_BASE}/rooms`, { method: "POST" });
-    if (!res.ok) { setError("Failed to create room"); return; }
-    const j = (await res.json()) as CreateRoomResp;
-    setRoomId(j.roomId);
-    setFingerprint(j.fingerprint);
-    if (j.networkIp) setNetworkIp(j.networkIp);
-  }
-
-  useEffect(() => {
-    if (!roomId) return;
-    let stopped = false;
-    const run = async () => {
-      try { await refreshToken(roomId); }
-      catch { if (!stopped) setError("Failed to get join token"); }
+    const msg = {
+      id: Math.random().toString(36),
+      from: nickName.trim() || identity?.slice(0, 6),
+      text: inputText,
+      ts: Date.now()
     };
-    void run();
-    const interval = setInterval(() => void run(), 60_000);
-    return () => { stopped = true; clearInterval(interval); };
-  }, [roomId]);
 
+    if (!sharedKeyRef.current) {
+      auditLog("panic", "Cannot send: Secure tunnel not established.");
+      return;
+    }
+
+    auditLog("sec", "Encrypting and Padding payload...");
+    const activeRoomId = currentRoomIdRef.current;
+    const ct = await Crypto.encrypt(sharedKeyRef.current!, JSON.stringify(msg), activeRoomId);
+
+    // Inject Jitter
+    await camouflageRef.current?.scheduleSend(() => {
+      peerRef.current?.send(ct);
+      setMessages(prev => [...prev, msg]);
+      setInputText("");
+      setSensitivityWarning(null);
+      // Notify end of typing
+      sendTypingSignal(false);
+    });
+  }
+
+  async function sendTypingSignal(isTyping: boolean) {
+    if (!sharedKeyRef.current || !peerRef.current) return;
+    const activeRoomId = currentRoomIdRef.current;
+    const sig = await Crypto.encrypt(sharedKeyRef.current, JSON.stringify({ type: "typing", isTyping }), activeRoomId);
+    peerRef.current.send(sig);
+  }
+
+  // Handle typing detection
   useEffect(() => {
-    if (!joinUrl) return;
-    void renderQr(joinUrl);
-  }, [joinUrl]);
+    if (inputText.length > 0) {
+      sendTypingSignal(true);
+      const timeout = setTimeout(() => sendTypingSignal(false), 3000);
+      return () => clearTimeout(timeout);
+    } else {
+      sendTypingSignal(false);
+    }
+  }, [inputText]);
 
-  // ── Styles ─────────────────────────────────────────────────────────────────
-  const s = {
-    main: {
+  function exitChat() {
+    auditLog("info", "Exiting chat and wiping session...");
+    peerRef.current?.wipe();
+    signalingRef.current?.close();
+    camouflageRef.current?.stop();
+    setStep("init");
+    setMessages([]);
+    setPeerState("disconnected");
+    setIsSearchingRandom(false);
+    currentRoomIdRef.current = "";
+  }
+
+  // 🎚️ Render Logic
+  return (
+    <main style={{
       minHeight: "100vh",
+      background: "linear-gradient(135deg, #0b0f14 0%, #0d1520 100%)",
+      color: "#e6edf3",
+      fontFamily: "'Inter', sans-serif",
       display: "grid",
       placeItems: "center",
-      padding: 16,
-      background: "linear-gradient(135deg, #0b0f14 0%, #0d1520 100%)",
-      fontFamily: "'Inter', 'Segoe UI', sans-serif",
-    } as React.CSSProperties,
-    card: {
-      width: "100%",
-      maxWidth: 540,
-      border: "1px solid #1e2d3d",
-      borderRadius: 20,
-      padding: "28px 24px",
-      background: "rgba(10,14,20,0.85)",
-      backdropFilter: "blur(12px)",
-      boxShadow: "0 8px 48px rgba(0,0,0,0.5)",
-      display: "grid",
-      gap: 16,
-    } as React.CSSProperties,
-  };
+      padding: 16
+    }}>
+      <AuditPanel />
+      <PanicManager />
 
-  const badgeStyle = (type: "tunnel" | "network" | "localhost"): React.CSSProperties => ({
-    padding: "12px 16px",
-    borderRadius: 12,
-    fontSize: 13,
-    lineHeight: 1.6,
-    border: type === "tunnel" ? "1px solid #3fb950"
-      : type === "network" ? "1px solid #58a6ff"
-        : "1px solid #dba642",
-    background: type === "tunnel" ? "rgba(63,185,80,0.08)"
-      : type === "network" ? "rgba(88,166,255,0.08)"
-        : "rgba(219,166,66,0.08)",
-    color: type === "tunnel" ? "#3fb950"
-      : type === "network" ? "#58a6ff"
-        : "#dba642",
-  });
+      <section
+        className="main-card"
+        style={{
+          width: "100%",
+          maxWidth: 600,
+          background: "rgba(10, 14, 20, 0.8)",
+          backdropFilter: "blur(20px)",
+          border: "1px solid #1e2d3d",
+          borderRadius: 24,
+          padding: "32px",
+          boxShadow: "0 12px 64px rgba(0,0,0,0.6)",
+          display: "grid",
+          gap: 24,
+          position: "relative"
+        }}>
 
-  return (
-    <main style={s.main}>
-      <section style={s.card}>
         {/* Header */}
-        <div>
-          <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#e6edf3", letterSpacing: "-0.5px" }}>
-            🔐 Ephemeral Chat
+        <header style={{ textAlign: "center" }}>
+          <h1 style={{ margin: 0, fontSize: 32, letterSpacing: "-1px", fontWeight: 800 }}>
+            GHOST<span style={{ color: "#79c0ff" }}>WIRE</span>
           </h1>
-          <p style={{ marginTop: 6, marginBottom: 0, color: "#7d8fa0", fontSize: 13, lineHeight: 1.5 }}>
-            No accounts. No logs. Keys wiped when you close the tab.
+          <p style={{ color: "#8b949e", fontSize: 13, marginTop: 8 }}>
+            End-to-End Encrypted Stranger & Private Chat
           </p>
-        </div>
+          {identity && (
+            <div style={{ marginTop: 12, display: "inline-block", padding: "4px 12px", background: "rgba(121, 192, 255, 0.1)", border: "1px solid rgba(121, 192, 255, 0.2)", borderRadius: 100, fontSize: 10, color: "#79c0ff" }}>
+              Identity Hash: {identity}
+            </div>
+          )}
+        </header>
 
-        {/* Tunnel status banner */}
-        {tunnelChecked && (
-          <div style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "8px 12px",
-            borderRadius: 10,
-            fontSize: 12,
-            background: tunnelUrl ? "rgba(63,185,80,0.08)" : "rgba(219,166,66,0.08)",
-            border: tunnelUrl ? "1px solid #3fb95040" : "1px solid #dba64240",
-            color: tunnelUrl ? "#3fb950" : "#dba642",
-          }}>
-            <span style={{ fontSize: 16 }}>{tunnelUrl ? "🌍" : "⏳"}</span>
-            <span>
-              {tunnelUrl
-                ? <>Global tunnel active — <strong>anyone can join from any network</strong></>
-                : "Starting Cloudflare tunnel… (takes ~10 seconds)"}
-            </span>
-          </div>
-        )}
-
-        {/* Create Room button */}
-        <button
-          onClick={onCreate}
-          style={{
-            padding: "12px 20px",
-            borderRadius: 12,
-            border: "0",
-            background: "linear-gradient(135deg, #238636, #2ea043)",
-            color: "#fff",
-            fontWeight: 700,
-            fontSize: 15,
-            cursor: "pointer",
-            transition: "opacity 0.15s",
-            letterSpacing: "0.2px",
-          }}
-          onMouseOver={e => (e.currentTarget.style.opacity = "0.85")}
-          onMouseOut={e => (e.currentTarget.style.opacity = "1")}
-        >
-          + Create Room
-        </button>
-
-        {error && <p style={{ color: "#ff7b72", fontSize: 12, margin: 0 }}>{error}</p>}
-
-        {roomId && (
-          <div style={{ display: "grid", gap: 12 }}>
-            {/* Room info */}
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#7d8fa0" }}>
-              <span>Room: <span style={{ color: "#e6edf3", fontFamily: "monospace" }}>{roomId.slice(0, 12)}…</span></span>
-              <span>Token expires: <span style={{ color: "#e6edf3" }}>{exp ? new Date(exp).toLocaleTimeString() : "…"}</span></span>
+        {step === "init" && (
+          <div style={{ display: "grid", gap: 20 }}>
+            <div style={{ display: "grid", gap: 8 }}>
+              <label style={{ fontSize: 13, color: "#8b949e" }}>Your Nickname (Optional)</label>
+              <input
+                value={nickName}
+                onChange={e => setNickName(e.target.value)}
+                placeholder="How peers will see you..."
+                style={{
+                  padding: "16px",
+                  borderRadius: 14,
+                  border: "1px solid #30363d",
+                  background: "#0b0f14",
+                  color: "#fff",
+                  fontSize: 16,
+                  outline: "none"
+                }}
+              />
             </div>
 
-            {/* QR Code */}
-            {qrDataUrl ? (
-              <div style={{
-                display: "grid",
-                placeItems: "center",
-                padding: 16,
-                border: "1px solid #1e2d3d",
-                borderRadius: 16,
-                background: "#fff",
-              }}>
-                <img src={qrDataUrl} alt="Join QR" width={260} height={260} style={{ display: "block" }} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: 20, background: "rgba(255,255,255,0.02)", borderRadius: 16, border: "1px solid #30363d" }}>
+                <h3 style={{ margin: 0, fontSize: 14 }}>Private Room</h3>
+                <input
+                  value={roomId}
+                  onChange={e => setRoomId(e.target.value)}
+                  placeholder="Room Code..."
+                  style={{
+                    padding: "10px",
+                    borderRadius: 10,
+                    border: "1px solid #30363d",
+                    background: "#0b0f14",
+                    color: "#fff",
+                    fontSize: 14,
+                    outline: "none"
+                  }}
+                />
+                <button
+                  onClick={() => startSession()}
+                  style={{
+                    padding: "12px",
+                    borderRadius: 10,
+                    border: "0",
+                    background: "#238636",
+                    color: "#fff",
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  Join Room
+                </button>
               </div>
-            ) : (
-              <div style={{
-                height: 292,
-                display: "grid",
-                placeItems: "center",
-                border: "1px solid #1e2d3d",
-                borderRadius: 16,
-                color: "#7d8fa0",
-                fontSize: 13,
-              }}>
-                Generating QR code…
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: 20, background: "rgba(121, 192, 255, 0.05)", borderRadius: 16, border: "1px solid rgba(121, 192, 255, 0.2)", justifyContent: "center", textAlign: "center" }}>
+                <h3 style={{ margin: 0, fontSize: 14 }}>Stranger Chat</h3>
+                <p style={{ fontSize: 11, color: "#8b949e", margin: 0 }}>Match with a random person online.</p>
+                <button
+                  onClick={startRandomSession}
+                  disabled={isSearchingRandom}
+                  style={{
+                    padding: "12px",
+                    borderRadius: 10,
+                    border: "0",
+                    background: "#1f6feb",
+                    color: "#fff",
+                    fontWeight: 700,
+                    cursor: "pointer",
+                    opacity: isSearchingRandom ? 0.5 : 1
+                  }}
+                >
+                  {isSearchingRandom ? "Finding..." : "Find Stranger"}
+                </button>
               </div>
-            )}
-
-            {/* Access type badge */}
-            {joinUrl && (
-              <>
-                <div style={badgeStyle(urlType)}>
-                  {urlType === "tunnel" ? (
-                    <>
-                      <strong>✅ GLOBAL ACCESS</strong> — This QR works from <strong>ANY network!</strong><br />
-                      WiFi, 4G, 5G, different city — anyone can scan and join instantly.
-                    </>
-                  ) : urlType === "network" ? (
-                    <>
-                      <strong>📱 LOCAL NETWORK</strong> — Works on your WiFi only.<br />
-                      Tunnel is still starting… refresh in a moment for global access. (IP: {networkIp})
-                    </>
-                  ) : (
-                    <>
-                      <strong>⚠️ LOCALHOST ONLY</strong> — This QR won't work on other devices.<br />
-                      Tunnel is starting… wait a few seconds and the QR will update automatically.
-                    </>
-                  )}
-                </div>
-
-                {/* Join link */}
-                <div style={{ fontSize: 11, color: "#4d6070" }}>
-                  <div style={{ marginBottom: 4, color: "#7d8fa0" }}>Join link:</div>
-                  <a
-                    href={joinUrl}
-                    style={{ color: "#58a6ff", wordBreak: "break-all", textDecoration: "none" }}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    {joinUrl}
-                  </a>
-                </div>
-
-                {/* Keep open warning */}
-                <div style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  background: "rgba(219,166,66,0.07)",
-                  border: "1px solid #dba64230",
-                  color: "#dba642",
-                  fontSize: 12,
-                }}>
-                  ⚠️ <strong>Keep this tab open!</strong> The room disappears when you navigate away.
-                </div>
-              </>
-            )}
+            </div>
           </div>
         )}
+
+        {step === "joining" && (
+          <div style={{ textAlign: "center", padding: 40 }}>
+            <div className="shred-loader" style={{ marginBottom: 20 }}></div>
+            <p>Negotiating Peer Handshake...</p>
+            <p style={{ fontSize: 11, color: "#8b949e", marginTop: 8 }}>Status: {peerState}</p>
+          </div>
+        )}
+
+        {step === "chat" && (
+          <div style={{ display: "flex", flexDirection: "column", height: 500 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, paddingBottom: 12, borderBottom: "1px solid #30363d" }}>
+              <div style={{ fontSize: 12, color: "#8b949e" }}>
+                Room: <strong style={{ color: "#e6edf3" }}>{roomId}</strong>
+              </div>
+              <button
+                onClick={exitChat}
+                style={{
+                  padding: "6px 14px",
+                  background: "rgba(255, 123, 114, 0.1)",
+                  border: "1px solid rgba(255, 123, 114, 0.2)",
+                  borderRadius: 8,
+                  color: "#ff7b72",
+                  fontSize: 11,
+                  fontWeight: 600,
+                  cursor: "pointer"
+                }}
+              >
+                Exit Chat
+              </button>
+            </div>
+            {/* Message Area */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "8px 0", display: "flex", flexDirection: "column", gap: 12 }}>
+              {messages.map(m => (
+                m.type === "system" ? (
+                  <div key={m.id} style={{ textAlign: "center", fontSize: 11, color: "#8b949e", margin: "10px 0", fontStyle: "italic" }}>
+                    {m.text}
+                  </div>
+                ) : (
+                  <div key={m.id} style={{
+                    padding: "12px 16px",
+                    borderRadius: 16,
+                    background: m.from === (nickName.trim() || identity?.slice(0, 6)) ? "rgba(35, 134, 54, 0.1)" : "rgba(255,255,255,0.05)",
+                    border: "1px solid",
+                    borderColor: m.from === (nickName.trim() || identity?.slice(0, 6)) ? "rgba(35, 134, 54, 0.3)" : "rgba(255,255,255,0.1)",
+                    alignSelf: m.from === (nickName.trim() || identity?.slice(0, 6)) ? "flex-end" : "flex-start",
+                    maxWidth: "85%"
+                  }}>
+                    <div style={{ fontSize: 10, color: "#8b949e", marginBottom: 4, display: "flex", gap: 8 }}>
+                      <span>{m.from}</span>
+                      <span>{new Date(m.ts).toLocaleTimeString()}</span>
+                    </div>
+                    <div style={{ fontSize: 14, lineHeight: 1.5 }}>{m.text}</div>
+                  </div>
+                )
+              ))}
+              {isPeerTyping && (
+                <div style={{ fontSize: 11, color: "#79c0ff", marginLeft: 8, fontStyle: "italic" }}>
+                  Peer is typing...
+                </div>
+              )}
+              {peerState !== "connected" && (
+                <div style={{ textAlign: "center", padding: "20px 10px", color: "#8b949e", fontSize: 13, border: "1px dashed #30363d", borderRadius: 16, margin: "10px 0" }}>
+                  <div style={{ marginBottom: 8 }}>🔍 Looking for peers in room <strong>{roomId}</strong>...</div>
+                  <div style={{ fontSize: 11 }}>Share this Room ID with someone to start chatting.</div>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(roomId);
+                      auditLog("info", "Room ID copied to clipboard!");
+                    }}
+                    style={{
+                      marginTop: 12,
+                      padding: "6px 12px",
+                      background: "rgba(255,255,255,0.05)",
+                      border: "1px solid #30363d",
+                      borderRadius: 8,
+                      color: "#e6edf3",
+                      fontSize: 11,
+                      cursor: "pointer"
+                    }}
+                  >
+                    Copy Room ID
+                  </button>
+                  <div style={{ fontSize: 11, marginTop: 12, color: peerState === "failed" ? "#ff7b72" : "#8b949e" }}>Status: {peerState}</div>
+                </div>
+              )}
+            </div>
+
+            {/* Input Area */}
+            <div style={{ marginTop: 20, display: "grid", gap: 8 }}>
+              {sensitivityWarning && (
+                <div style={{ padding: "8px 12px", background: "rgba(255, 123, 114, 0.1)", border: "1px solid rgba(255, 123, 114, 0.3)", borderRadius: 10, fontSize: 11, color: "#ff7b72" }}>
+                  🚨 <strong>Privacy Alert</strong>: Potential PII detected!
+                  <ul style={{ margin: "4px 0", paddingLeft: 16 }}>
+                    {sensitivityWarning.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                  <button onClick={() => setSensitivityWarning(null)} style={{ background: "none", border: "0", color: "#58a6ff", cursor: "pointer", fontSize: 10, padding: 0 }}>Ignore and Send</button>
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 12 }}>
+                <input
+                  value={inputText}
+                  onChange={e => setInputText(e.target.value)}
+                  onKeyDown={e => e.key === "Enter" && sendMessage()}
+                  placeholder="Type a disappearing message..."
+                  style={{
+                    flex: 1,
+                    padding: "14px 18px",
+                    borderRadius: 14,
+                    border: "1px solid #30363d",
+                    background: "#0b0f14",
+                    color: "#fff",
+                    fontSize: 15,
+                    outline: "none"
+                  }}
+                />
+                <button
+                  onClick={sendMessage}
+                  style={{
+                    padding: "0 24px",
+                    borderRadius: 14,
+                    border: "0",
+                    background: "#e6edf3",
+                    color: "#0b0f14",
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  Send
+                </button>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 2px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "#8b949e" }}>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: peerState === "connected" ? "#3fb950" : "#ff7b72" }}></span>
+                  P2P Secure Tunnel
+                </div>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10, color: "#8b949e", cursor: "pointer" }}>
+                  <input type="checkbox" checked={isLowBandwidth} onChange={e => setIsLowBandwidth(e.target.checked)} />
+                  Low Bandwidth Mode
+                </label>
+              </div>
+            </div>
+          </div>
+        )}
+
       </section>
+
+      <style dangerouslySetInnerHTML={{
+        __html: `
+        .shred-loader {
+          width: 48px;
+          height: 48px;
+          border: 4px solid rgba(255,255,255,0.1);
+          border-top: 4px solid #ff7b72;
+          border-radius: 50%;
+          animation: spin 1s linear infinite;
+          display: inline-block;
+        }
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
+        }
+        @media (max-width: 768px) {
+          .main-card {
+            padding: 20px !important;
+            border-radius: 16px !important;
+          }
+          .panic-btn {
+            top: 10px !important;
+            right: 10px !important;
+            padding: 6px 12px !important;
+            font-size: 10px !important;
+          }
+        }
+      `}} />
     </main>
   );
 }

@@ -21,7 +21,7 @@ export interface Metric {
     name: string;
     type: MetricType;
     value: number;
-    labels?: Record<string, string>;
+    labels?: Record<string, string> | undefined;
     timestamp: number;
 }
 
@@ -86,9 +86,9 @@ export class MetricsCollector {
             if (values.length === 0) continue;
 
             const sorted = [...values].sort((a, b) => a - b);
-            const p50 = sorted[Math.floor(sorted.length * 0.5)];
-            const p95 = sorted[Math.floor(sorted.length * 0.95)];
-            const p99 = sorted[Math.floor(sorted.length * 0.99)];
+            const p50 = sorted[Math.floor(sorted.length * 0.5)] ?? 0;
+            const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? 0;
+            const p99 = sorted[Math.floor(sorted.length * 0.99)] ?? 0;
 
             metrics.push({
                 name: `${name}_p50`,
@@ -184,7 +184,7 @@ export class MetricsCollector {
         const match = key.match(/^([^{]+)(?:\{(.+)\})?$/);
         if (!match) return { name: key };
 
-        const name = match[1];
+        const name = match[1] ?? key;
         const labelStr = match[2];
 
         if (!labelStr) return { name };

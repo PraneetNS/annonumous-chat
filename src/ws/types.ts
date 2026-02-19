@@ -24,7 +24,8 @@ export const JoinRequestSchema = z.object({
   body: z.object({
     roomId: z.string().min(8).max(128),
     token: z.string().min(8).max(2048).optional(),
-    qrToken: z.string().min(8).max(2048).optional()
+    qrToken: z.string().min(8).max(2048).optional(),
+    label: z.string().min(1).max(32).optional()
   }).refine(data => data.token || data.qrToken, {
     message: "Either 'token' or 'qrToken' must be provided",
     path: ["token"]
@@ -51,6 +52,34 @@ export const AppMsgSchema = z.object({
   })
 });
 
+// MEDIA_MSG: encrypted image/file sharing (chunked, server relays opaque ciphertext)
+export const MediaMsgSchema = z.object({
+  v: z.literal(1),
+  t: z.literal("MEDIA_MSG"),
+  id: z.string(),
+  body: z.object({
+    roomId: z.string().min(8).max(128),
+    // Opaque encrypted media envelope — server never inspects payload.
+    // mime + size are hints for the receiving client only.
+    mime: z.string().max(128),
+    size: z.coerce.number().int().min(1).max(10_485_760), // 10 MB max
+    chunkSize: z.coerce.number().int().min(1024),
+    // Each chunk is base64url(nonce || ciphertext); up to ~128 chunks of 256 KB
+    chunks: z.array(z.string().min(1)).min(1).max(128)
+  })
+});
+
+export const SystemMsgSchema = z.object({
+  v: z.literal(1),
+  t: z.literal("SYSTEM_MSG"),
+  id: z.string(),
+  body: z.object({
+    roomId: z.string().min(8).max(128),
+    text: z.string().max(1024),
+    type: z.enum(["info", "warn", "error"]).default("info")
+  })
+});
+
 export const PingSchema = z.object({
   v: z.literal(1),
   t: z.literal("PING"),
@@ -63,5 +92,6 @@ export type ClientMsg =
   | z.infer<typeof JoinRequestSchema>
   | z.infer<typeof LeaveSchema>
   | z.infer<typeof AppMsgSchema>
+  | z.infer<typeof MediaMsgSchema>
+  | z.infer<typeof SystemMsgSchema>
   | z.infer<typeof PingSchema>;
-

@@ -1,223 +1,79 @@
-## Ephemeral encrypted chat WS server (Fastify + Redis)
+# 🚀 DIGITAL SHREDDER
 
-This is a **relay-only** WebSocket server intended for end-to-end encrypted group chat.
+### The Zero-Metadata, Anti-Forensic, P2P Ephemeral Communication Engine.
 
-- **No message persistence**: the server never stores messages; it only fanouts opaque ciphertext.
-- **Rooms are ephemeral**: room state exists in **Redis with TTL** and is **deleted when the last participant disconnects**.
-- **10-user hard cap** per room (enforced atomically in Redis).
-- **Replay protection** for join tokens (Redis `SET NX PX` on token `jti`).
-- **Flood protection**: per-IP connection cap, per-connection token buckets, and message size limits.
-- **Never log message contents**: handlers do not log any payloads, and request bodies are redacted.
-- **Production-hardened**: Security headers, CORS, rate limiting, health checks, and metrics.
+Digital Shredder is not a chat app. It is a communication **node** designed for high-risk environments where anonymity and metadata elimination are as important as message encryption.
 
 ---
 
-## Quick Start (Development)
+## 🔐 Cryptographic Architecture
 
-### Setup
+### 1. Ephemeral session Identity
+- **Algorithm**: ECDH (Elliptic Curve Diffie-Hellman) over the **P-384** curve.
+- **Persistence**: Zero. Keypairs are generated in-memory upon page load and are never stored in `localStorage`, `sessionStorage`, or `IndexedDB`.
+- **Identity Hash**: Your "Username" is a SHA-256 fingerprint of your public key, regenerated every session.
 
-1) Install dependencies:
+### 2. P2P Mesh (WebRTC)
+- **Encryption**: AES-256-GCM (Authenticated Encryption).
+- **Transport**: WebRTC Data Channels. Signals are passed through a "blind" relay server that never sees the content.
+- **Zero-Knowledge Relay**: Post-handshake, the server is out of the loop. Traffic flows directly between peers.
 
+### 3. Metadata Camouflage
+- **Padding**: Every message is padded to a fixed **4KB** block size to prevent traffic analysis through length observation.
+- **Jitter**: High-entropy jitter is injected into packet timing to prevent temporal fingerprinting.
+- **Noise**: The engine sends dummy encrypted packets at random intervals, making it impossible to tell when a human is actually communicating.
+
+---
+
+## 🛡️ Anti-Forensic Protection
+
+- **The Eraser Module**: Hooks into browser `visibilitychange`, `blur`, and `unload` events.
+- **Memory Scrambling**: Buffers are manually zeroed (`.fill(0)`) before they are released to the browser's Garbage Collector.
+- **Panic Trigger**: `Ctrl+Shift+X` instantly nukes the session, wipes all keys, and redirects to `about:blank`.
+- **Cache Elimination**: All service workers, storage APIs, and browser caching are disabled or bypassed.
+
+---
+
+## 🧠 Local AI Sensitivity Scanner
+- **Privacy First**: Analysis happens 100% in-browser using Regex and Shannon Entropy analysis.
+- **Data Leaks**: Detects Emails, Phone numbers, Crypto addresses, and high-entropy strings (passwords/keys) before they are encrypted and sent.
+
+---
+
+## ⚠️ Threat Model & Attack Surface
+
+### What it PROTECTS against:
+1.  **Server Seizure**: The signaling server has zero logs of who talked to whom and zero message content.
+2.  **Network Surveillance**: ISP/State actors see normalized, jittered HTTPS traffic that looks like background noise.
+3.  **Physical Device Forensic**: If the browser is closed or the tab minimized, keys are wiped from memory.
+
+### What it DOES NOT protect against:
+1.  **Screen Recording/Keyloggers**: If your device is already compromised by malware, it can see what you type.
+2.  **State-Actor Level Traffic Temporal Analysis**: While jitter helps, a massive AI-driven analysis of global traffic patterns could still potentially correlate connections.
+3.  **Browser Exploits**: Vulnerabilities in the Chrome/Firefox V8 engine could potentially leak memory before it is wiped.
+
+---
+
+## 🏗 Deployment instructions
+
+### Local Development
 ```bash
 npm install
+npm run dev:all
 ```
 
-2) Start Redis locally (example):
-
-```bash
-docker run --rm -p 6379:6379 redis:7
-```
-
-3) Set environment variables (copy from `env.example`):
-
-```bash
-cp env.example .env
-```
-
-Edit `.env` and set:
-- `REDIS_URL`
-- `JOIN_TOKEN_SECRET` (32+ bytes)
-
-4) Run dev server:
-
-```bash
-npm run dev
-```
-
-### WebSocket endpoint
-
-- Connect to `ws(s)://<host>:<port>/ws`
-- Send JSON messages as described in `src/ws/types.ts`.
+### Production (Manual)
+1.  Expose the signaling server via HTTPS (HTTPS is **REQUIRED** for WebCrypto).
+2.  Use a STUN/TURN server for P2P connectivity across restricted NATs.
 
 ---
 
-## Production Deployment
-
-### Prerequisites
-
-- Node.js 20.11+
-- Redis 7+ (managed service recommended)
-- Reverse proxy with TLS termination (Nginx, HAProxy, or cloud load balancer)
-- (Optional) Docker & Docker Compose
-
-### Deployment Options
-
-#### Option 1: Docker (Recommended)
-
-1. **Generate secrets**:
-```bash
-openssl rand -base64 48
-```
-
-2. **Configure environment**:
-```bash
-cp .env.production .env
-# Edit .env and set JOIN_TOKEN_SECRET and other production values
-```
-
-3. **Build and deploy**:
-```bash
-docker-compose up -d
-```
-
-4. **Verify deployment**:
-```bash
-curl http://localhost:3001/health
-curl http://localhost:3001/metrics
-```
-
-#### Option 2: PM2 (Node.js)
-
-1. **Build application**:
-```bash
-npm ci --production
-npm run build
-```
-
-2. **Configure environment**:
-```bash
-cp .env.production .env
-# Edit .env with production values
-```
-
-3. **Start with PM2**:
-```bash
-npm install -g pm2
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup
-```
-
-4. **Monitor**:
-```bash
-pm2 status
-pm2 logs
-pm2 monit
-```
-
-### Production Configuration
-
-See `.env.production` for all available configuration options.
-
-**Critical settings**:
-- `JOIN_TOKEN_SECRET`: Generate with `openssl rand -base64 48`
-- `REDIS_URL`: Production Redis instance
-- `CORS_ALLOWED_ORIGINS`: Comma-separated list of allowed origins (never use `*`)
-- `FEATURE_DETAILED_ERRORS`: Set to `false` in production
-- `LOG_LEVEL`: Set to `info` or `warn`
-
-### Feature Toggles
-
-Control production features via environment variables:
-
-- `FEATURE_HEALTH_ENDPOINT`: Enable `/health` endpoint
-- `FEATURE_METRICS_ENDPOINT`: Enable `/metrics` endpoint (Prometheus-compatible)
-- `FEATURE_READINESS_ENDPOINT`: Enable `/ready` endpoint
-- `FEATURE_GRACEFUL_SHUTDOWN`: Enable graceful shutdown on SIGTERM/SIGINT
-- `FEATURE_CORS`: Enable CORS middleware
-- `FEATURE_SECURITY_HEADERS`: Enable security headers (CSP, HSTS, etc.)
-- `FEATURE_REQUEST_ID`: Enable request ID tracking
-
-### Health & Metrics Endpoints
-
-- **Health Check**: `GET /health` - Detailed health status (Redis, memory, connections)
-- **Readiness Probe**: `GET /ready` - Simple ready/not-ready status
-- **Liveness Probe**: `GET /live` - Always returns 200 if process is running
-- **Metrics**: `GET /metrics` - Prometheus-compatible metrics (or JSON with `Accept: application/json`)
-
-### Monitoring
-
-**Key metrics** (Prometheus format at `/metrics`):
-- `active_connections`: Current WebSocket connections
-- `total_connections`: Total connections since start
-- `ws_connection_rejected`: Rejected connections by reason
-- `ws_messages_sent`: Messages sent by type
-- `redis_ready`: Redis connection status
-- `uptime_seconds`: Service uptime
-
-**Recommended alerts**:
-- Service down (health check fails)
-- Redis unavailable
-- High error rate (>1%)
-- High memory usage (>80%)
-- Connection capacity (>90%)
-
-### Security
-
-**Built-in security features**:
-- ✅ Content Security Policy (CSP)
-- ✅ HTTP Strict Transport Security (HSTS)
-- ✅ CORS with configurable origins
-- ✅ Rate limiting (per-IP and per-connection)
-- ✅ Request ID tracking
-- ✅ Security headers (X-Content-Type-Options, X-Frame-Options, etc.)
-- ✅ Slow consumer protection
-- ✅ Token replay protection
-
-**Additional recommendations**:
-- Use TLS/SSL (terminate at load balancer)
-- Enable DDoS protection (Cloudflare, AWS Shield, etc.)
-- Use managed Redis with authentication
-- Implement additional rate limiting at WAF/load balancer
-- Regular security audits and dependency updates
-
-### Scaling
-
-**Horizontal scaling**:
-- Run multiple instances behind a load balancer
-- Enable sticky sessions for WebSocket connections
-- All instances share the same Redis
-
-**Vertical scaling**:
-- Increase container memory limit
-- Adjust `MAX_TOTAL_CONNECTIONS` based on resources
-
-**Load balancer configuration**:
-- Enable WebSocket upgrade headers
-- Set connection timeout: 60s
-- Set idle timeout: 300s (5 minutes)
-- Set WebSocket timeout: 3600s (1 hour)
-- Enable connection draining for graceful shutdown
+## 🛠 Future Research
+- **VDF Time-Locks**: Integrating Verifiable Delay Functions for mathematical time-locked decryption.
+- **Post-Quantum Crypto**: Transitioning to Kyber/Dilithium for PQC resistance.
+- **steganographic fallbacks**: Hiding signaling data inside common image/pixel formats.
 
 ---
 
-## Documentation
-
-- **[Deployment Checklist](DEPLOYMENT.md)**: Complete production deployment guide
-- **[Runbook](RUNBOOK.md)**: Operational procedures and troubleshooting
-- **[Environment Configuration](.env.production)**: All configuration options
-
----
-
-## Notes
-
-- This server is **not** an MLS implementation. It is an ephemeral room + ciphertext relay suitable for MLS clients.
-- For real deployments, enforce additional rate limits and connection limits at the load balancer / WAF.
-- **E2EE guarantee**: The server NEVER decrypts, stores, or logs message contents. All cryptographic operations happen client-side.
-
----
-
-## License
-
-[Your license here]
-
+### 🚨 SECURITY WARNING 🚨
+*This software is experimental. In high-risk situations, always combine Digital Shredder with a trusted VPN and a hardened OS (like Tails or Qubes OS). Use at your own risk.*

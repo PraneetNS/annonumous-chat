@@ -119,8 +119,8 @@ const requestHandler = (req, res) => {
         return;
     }
 
-    // ── Route: API + WS → backend (3001), everything else → frontend (3000) ──
-    if (req.url.startsWith('/api') || req.url.startsWith('/ws')) {
+    // ── Route: API + WS + Signaling → backend (3001), everything else → frontend (3000) ──
+    if (req.url.startsWith('/api') || req.url.startsWith('/ws') || req.url.startsWith('/signaling')) {
         if (req.url.startsWith('/api/')) req.url = req.url.substring(4);
         proxy.web(req, res, { target: 'https://127.0.0.1:3001' });
     } else {
@@ -133,7 +133,7 @@ const upgradeHandler = (req, socket, head) => {
     // Set socket timeout to detect dead WS connections at the proxy level
     socket.setTimeout(120_000, () => socket.destroy());
 
-    if (req.url.startsWith('/ws')) {
+    if (req.url.startsWith('/ws') || req.url.startsWith('/signaling')) {
         proxy.ws(req, socket, head, { target: 'wss://127.0.0.1:3001' });
     } else {
         proxy.ws(req, socket, head, { target: 'wss://127.0.0.1:3000' });

@@ -12,6 +12,7 @@ import { RoomStore } from "./rooms/roomStore.js";
 import { randomIdB64Url } from "./utils/base64url.js";
 import { mintJoinToken } from "./security/joinTokens.js";
 import { getLocalNetworkIP } from "./utils/network.js";
+import { registerSignaling } from "./shredder/signaling.js";
 
 export async function buildServer() {
   const config = loadConfig();
@@ -56,7 +57,7 @@ export async function buildServer() {
   const fastifyOpts: any = {
     logger: loggerConfig,
     trustProxy: config.TRUST_PROXY,
-    bodyLimit: 64 * 1024,
+    bodyLimit: 16 * 1024 * 1024,
     keepAliveTimeout: config.HTTP_KEEP_ALIVE_TIMEOUT_MS,
     requestIdHeader: "x-request-id",
     requestIdLogLabel: "requestId",
@@ -150,6 +151,9 @@ export async function buildServer() {
 
   // Legacy healthz endpoint (kept for backward compatibility)
   fastify.get("/healthz", async () => ({ ok: true }));
+
+  // Register signaling for Shredder
+  registerSignaling(fastify as any);
 
   // Register WebSocket handlers (pass connection tracking)
   registerWs(fastify as any, {

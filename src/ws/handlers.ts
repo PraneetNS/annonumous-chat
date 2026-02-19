@@ -4,7 +4,7 @@ import { randomIdB64Url } from "../utils/base64url.js";
 import { RoomStore } from "../rooms/roomStore.js";
 import { mintJoinToken, verifyJoinToken } from "../security/joinTokens.js";
 import { TokenBucket, IpConnectionLimiter, GlobalConnectionLimiter } from "../security/rateLimit.js";
-import { AppMsgSchema, JoinRequestSchema, LeaveSchema, PingSchema, RoomCreateSchema, WsEnvelopeSchema, type ClientMsg } from "./types.js";
+import { AppMsgSchema, JoinRequestSchema, LeaveSchema, MediaMsgSchema, PingSchema, RoomCreateSchema, WsEnvelopeSchema, type ClientMsg } from "./types.js";
 import { getMetrics } from "../observability/metrics.js";
 
 type ConnCtx = {
@@ -12,6 +12,7 @@ type ConnCtx = {
   ip: string;
   ws: WebSocket;
   roomId: string | undefined;
+  label: string | undefined;
   msgBucket: TokenBucket;
   bytesBucket: TokenBucket;
   /** Last pong received — used to detect dead connections */
@@ -110,7 +111,9 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
       // Process up to 50 sends per tick to balance throughput vs latency
       const end = Math.min(i + 50, connIds.length);
       while (i < end) {
-        const ctx = connections.get(connIds[i++]);
+        const id = connIds[i++];
+        if (id === undefined) continue;
+        const ctx = connections.get(id);
         if (!ctx || ctx.ws.readyState !== 1) continue;
         if (ctx.ws.bufferedAmount > config.MAX_WS_MSG_BYTES * 4) {
           // Slow consumer — disconnect rather than accumulate backpressure
@@ -176,6 +179,12 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
     if (remaining <= 0) {
       await cleanupIfEmpty(roomId);
     } else {
+      if (ctx.label) {
+        broadcast(roomId, {
+          v: 1, t: "SYSTEM_MSG", id: randomIdB64Url(12),
+          body: { roomId, text: `${ctx.label} has left the chat`, type: "info" }
+        });
+      }
       broadcast(roomId, {
         v: 1, t: "ROOM_STATS", id: randomIdB64Url(12),
         body: { roomId, participants: remaining, max: config.ROOM_MAX_PARTICIPANTS }
@@ -204,6 +213,7 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
       case "JOIN_REQUEST": { const v = JoinRequestSchema.safeParse(env.data); return v.success ? v.data : null; }
       case "LEAVE": { const v = LeaveSchema.safeParse(env.data); return v.success ? v.data : null; }
       case "APP_MSG": { const v = AppMsgSchema.safeParse(env.data); return v.success ? v.data : null; }
+      case "MEDIA_MSG": { const v = MediaMsgSchema.safeParse(env.data); return v.success ? v.data : null; }
       case "PING": { const v = PingSchema.safeParse(env.data); return v.success ? v.data : null; }
       default: return null;
     }
@@ -233,6 +243,7 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
       ip,
       ws: socket,
       roomId: undefined,
+      label: undefined,
       msgBucket: new TokenBucket({
         capacity: config.MAX_MSGS_PER_10S,
         refillTokens: config.MAX_MSGS_PER_10S,
@@ -356,14 +367,21 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
             const local = ensureLocalRoom(roomId);
             local.conns.add(ctx.connId);
             ctx.roomId = roomId;
+            ctx.label = msg.body.label || joined.label;
 
             const nextToken = mintJoinToken(config.JOIN_TOKEN_SECRET, roomId, Date.now() + config.ROOM_KEY_TTL_MS);
             const nextTokenExpUnixMs = Date.now() + config.ROOM_KEY_TTL_MS;
 
             wsSend(ctx, {
               v: 1, t: "JOINED", id: randomIdB64Url(12),
-              body: { roomId, participants: joined.count, max: config.ROOM_MAX_PARTICIPANTS, label: joined.label, nextToken, nextTokenExpUnixMs }
+              body: { roomId, participants: joined.count, max: config.ROOM_MAX_PARTICIPANTS, label: ctx.label, nextToken, nextTokenExpUnixMs }
             });
+
+            broadcast(roomId, {
+              v: 1, t: "SYSTEM_MSG", id: randomIdB64Url(12),
+              body: { roomId, text: `this person has entered the chat with the name ${ctx.label}`, type: "info" }
+            });
+
             broadcast(roomId, { v: 1, t: "ROOM_STATS", id: randomIdB64Url(12), body: { roomId, participants: joined.count, max: config.ROOM_MAX_PARTICIPANTS } });
             metrics.incrementCounter("rooms_joined");
             return;
@@ -390,6 +408,26 @@ export function registerWs(fastify: FastifyInstance, callbacks?: WsCallbacks) {
             // Relay opaque ciphertext. Do not log. Do not parse.
             broadcast(roomId, { v: 1, t: "APP_MSG", id: randomIdB64Url(12), body: { roomId, ciphertextB64 } });
             metrics.incrementCounter("messages_relayed");
+            return;
+          }
+
+          case "MEDIA_MSG": {
+            // Encrypted image/file relay — server is a blind relay, never inspects content.
+            const { roomId, mime, size, chunkSize, chunks } = msg.body;
+            if (ctx.roomId !== roomId) {
+              wsSend(ctx, { v: 1, t: "ERROR", id: randomIdB64Url(12), body: { code: "ERR_NOT_IN_ROOM", retryable: false } });
+              return;
+            }
+            // Cap total serialized chunk data at 14 MB (base64 overhead ~33%)
+            const totalChunkBytes = chunks.reduce((acc, c) => acc + Buffer.byteLength(c, "utf8"), 0);
+            const MAX_RELAY_BYTES = 14 * 1024 * 1024;
+            if (totalChunkBytes > MAX_RELAY_BYTES) {
+              wsSend(ctx, { v: 1, t: "ERROR", id: randomIdB64Url(12), body: { code: "ERR_MEDIA_TOO_LARGE", retryable: false } });
+              return;
+            }
+            // Relay opaque encrypted media to room. Do NOT log chunks.
+            broadcast(roomId, { v: 1, t: "MEDIA_MSG", id: randomIdB64Url(12), body: { roomId, mime, size, chunkSize, chunks, from: msg.body.from } });
+            metrics.incrementCounter("media_relayed");
             return;
           }
         }

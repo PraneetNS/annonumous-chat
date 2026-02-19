@@ -31,8 +31,8 @@ const envSchema = z.object({
   ROOM_KEY_TTL_MS: z.coerce.number().int().min(60_000).default(600_000),
   QR_ROTATION_MS: z.coerce.number().int().min(10_000).default(60_000),
 
-  // Message size limits
-  MAX_WS_MSG_BYTES: z.coerce.number().int().min(1024).default(262_144),
+  // Message size limits — raised to 16 MB to support encrypted image sharing
+  MAX_WS_MSG_BYTES: z.coerce.number().int().min(1024).default(16_777_216),
   MAX_APP_CIPHERTEXT_BYTES: z.coerce.number().int().min(1024).default(65_536),
 
   // Rate limiting & flood protection
