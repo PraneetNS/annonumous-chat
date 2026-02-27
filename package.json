@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:server": "tsx watch src/index.ts",
-    "dev:web": "concurrently \"next dev -H 0.0.0.0 -p 3002\" \"local-ssl-proxy --hostname 0.0.0.0 --source 3000 --target 3002 --key server/certs/key.pem --cert server/certs/cert.pem\"",
+    "dev:web": "concurrently \"next dev -H 0.0.0.0 -p 3002\" \"local-ssl-proxy --hostname 0.0.0.0 --source 3010 --target 3002 --key server/certs/key.pem --cert server/certs/cert.pem\"",
     "dev:proxy": "node scripts/unified-proxy.js",
     "dev:tunnel": "node scripts/tunnel-manager.js",
     "dev:all": "concurrently \"npm run dev\" \"npm run dev:web\" \"npm run dev:proxy\" \"npm run dev:tunnel\"",
