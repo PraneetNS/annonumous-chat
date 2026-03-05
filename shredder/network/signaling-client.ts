@@ -14,7 +14,13 @@ export type SignalingEvent =
     | { t: "ANSWER", from: string, sdp: RTCSessionDescriptionInit }
     | { t: "ICE", from: string, candidate: RTCIceCandidateInit }
     | { t: "MATCH", roomId: string }
-    | { t: "PUBKEY", jwk: JsonWebKey };
+    | { t: "PUBKEY", jwk: JsonWebKey }
+    | { t: "ROOM_INFO", peers: string[], yourPeerId: string }
+    | { t: "PEER_JOIN", peerId: string, fingerprint: string }
+    | { t: "PEER_LEAVE", peerId: string }
+    | { t: "MESH_OFFER", peerId: string, targetPeerId: string, sdp: RTCSessionDescriptionInit }
+    | { t: "MESH_ANSWER", peerId: string, targetPeerId: string, sdp: RTCSessionDescriptionInit }
+    | { t: "MESH_ICE", peerId: string, targetPeerId: string, candidate: RTCIceCandidateInit };
 
 export class SignalingClient {
     private ws: WebSocket | null = null;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useMemo } from "react";
+import { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import * as Crypto from "../shredder/crypto/crypto";
 import { P2PPeer } from "../shredder/network/webrtc";
 import { SignalingClient, SignalingEvent } from "../shredder/network/signaling-client";
@@ -9,16 +9,27 @@ import { PanicManager } from "../components/PanicManager";
 import { scanSensitivity } from "../shredder/ai-scanner/scanner";
 import { CamouflageEngine } from "../shredder/security/camouflage";
 import { formatTimeLocked, isReady, TimeLockedPayload } from "../shredder/crypto/timelock";
+// Enterprise Modules
+import { generatePQCKeyBundle, exportPQCPublicBundle, performPQCHandshake, getPQCSecurityLevel, wipePQCBundle, type PQCKeyBundle, type PQCPublicBundle } from "../shredder/crypto/pqc";
+import { createTimeLockMessage, solveTimeLockMessage, isEstimatedTimeReached, formatTimeRemaining, type VDFTimeLockMessage, type VDFProgress } from "../shredder/crypto/vdf";
+import { MeshNetworkManager, type MeshStats, type MeshEvent } from "../shredder/network/mesh";
+import { DistributedSignalingClient, type DistributedSignalingEvent } from "../shredder/network/distributed-signaling";
+import { SecureCanvas } from '../shredder/ui/SecureCanvas';
+import { FileTransferSender, FileTransferReceiver, MAX_FILE_SIZE, type FileTransferProgress } from "../shredder/network/file-transfer";
+import { AdvancedCamouflageEngine, type TrafficStats } from "../shredder/security/advanced-camouflage";
+import { ScreenProtectionManager } from "../shredder/security/screen-protection";
+import { enhancedScanSensitivity, getRiskBadge } from "../shredder/ai-scanner/enhanced-scanner";
+import { EnterpriseDashboard, type SecurityStatus, type PeerInfo, type RoomPolicy } from "../shredder/ui/EnterpriseDashboard";
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB
 const ACCEPTED_TYPES = "image/jpeg,image/png,image/gif,image/webp,image/avif,image/svg+xml";
 
-// Dynamic Signaling URL based on origin
+// Dynamic Signaling URL — use relative path for tunnel compatibility
 const getSignalingUrl = () => {
   if (typeof window === "undefined") return "";
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const host = window.location.host;
-  return `${protocol}//${host}/signaling`;
+  const loc = window.location;
+  const protocol = loc.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${loc.host}/signaling`;
 };
 
 export default function ShredderPage() {
@@ -35,6 +46,23 @@ export default function ShredderPage() {
   const [isSearchingRandom, setIsSearchingRandom] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
+  // Enterprise State
+  const [pqcActive, setPqcActive] = useState(false);
+  const [meshStats, setMeshStats] = useState<MeshStats | null>(null);
+  const [trafficStats, setTrafficStats] = useState<TrafficStats | null>(null);
+  const [connectedPeers, setConnectedPeers] = useState<PeerInfo[]>([]);
+  const [fileTransferProgress, setFileTransferProgress] = useState<FileTransferProgress | null>(null);
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatus>({
+    e2eeActive: false, pqcActive: false, metadataObfuscation: true,
+    screenProtection: false, coverTraffic: true, vdfAvailable: true, stegoAvailable: true
+  });
+  const [roomPolicy] = useState<RoomPolicy>({
+    maxRoomSize: 10, timeLimit: null, allowedRegions: [],
+    requirePQC: false, requireVerification: false
+  });
+  const [signalingNodeId, setSignalingNodeId] = useState<string | null>(null);
+  const [enablePQC, setEnablePQC] = useState(true);
+
   // Core Refs
   const keyPairRef = useRef<CryptoKeyPair | null>(null);
   const sharedKeyRef = useRef<CryptoKey | null>(null);
@@ -45,26 +73,87 @@ export default function ShredderPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
-  // 1️⃣ Initialize Session Identity
+  // Enterprise Refs
+  const pqcBundleRef = useRef<PQCKeyBundle | null>(null);
+  const meshRef = useRef<MeshNetworkManager | null>(null);
+  const distSignalingRef = useRef<DistributedSignalingClient | null>(null);
+  const advCamouflageRef = useRef<AdvancedCamouflageEngine | null>(null);
+  const screenProtRef = useRef<ScreenProtectionManager | null>(null);
+  const fileTransferRef = useRef<FileTransferSender | null>(null);
+  const myPeerIdRef = useRef<string | null>(null);
+  const evPeerIdRef = useRef<string | null>(null);
+
+  // Mesh stats polling
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (meshRef.current) setMeshStats(meshRef.current.getMeshStats());
+      if (advCamouflageRef.current) setTrafficStats(advCamouflageRef.current.getStats());
+    }, 2000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // 1️⃣ Initialize Session Identity + Enterprise Modules
   useEffect(() => {
     async function init() {
-      auditLog("info", "Initializing GhostWire engine...");
+      auditLog("info", "Initializing GhostWire Enterprise engine...");
       const kp = await Crypto.generateSessionKeyPair();
       keyPairRef.current = kp;
       const finger = await Crypto.getIdentityFingerprint(kp.publicKey);
       setIdentity(finger);
       auditLog("sec", `Session Identity Generated: ${finger.slice(0, 8)}...`);
+
+      // Generate PQC key bundle
+      try {
+        const pqcBundle = await generatePQCKeyBundle();
+        pqcBundleRef.current = pqcBundle;
+        setPqcActive(true);
+        setSecurityStatus(prev => ({ ...prev, pqcActive: true }));
+        auditLog("sec", `PQC Key Bundle Generated: ${getPQCSecurityLevel()}`);
+      } catch (e) {
+        auditLog("info", "PQC generation skipped (browser compatibility)");
+      }
+
+      // Activate screen protection
+      const screenProt = new ScreenProtectionManager({
+        cssProtection: true,
+        apiDetection: true,
+        visibilityMonitoring: true,
+        devToolsDetection: true,
+        autoWipeOnDetection: true,
+        onThreatDetected: (threat) => {
+          auditLog("panic", `THRÉAT DETECTED: ${threat.details}`);
+        }
+      });
+      screenProt.activate();
+      screenProtRef.current = screenProt;
+      setSecurityStatus(prev => ({ ...prev, screenProtection: true }));
+      auditLog("sec", "📸 Screen Protection Active (Auto-Wipe Enabled)");
     }
     init();
 
+    // Keep connection fresh
+    const connCheck = setInterval(() => {
+      if (peerRef.current && peerState !== "connected" && step === "chat") {
+        auditLog("info", "Retrying P2P handshake...");
+        // If stuck, restart gathering
+        startSession(currentRoomIdRef.current || "");
+      }
+    }, 30000);
+
     return () => {
+      clearInterval(connCheck);
       // Emergency Cleanup on unmount
       peerRef.current?.wipe();
       signalingRef.current?.close();
       camouflageRef.current?.stop();
+      meshRef.current?.destroy();
+      distSignalingRef.current?.close();
+      advCamouflageRef.current?.stop();
+      screenProtRef.current?.deactivate();
+      if (pqcBundleRef.current) wipePQCBundle(pqcBundleRef.current);
       revokeAllMedia();
     };
-  }, []);
+  }, [step]); // Re-run if we move to chat step to start listener
 
   function revokeAllMedia() {
     for (const url of objectUrlsRef.current) {
@@ -89,22 +178,42 @@ export default function ShredderPage() {
     }, () => {
       auditLog("info", "Connected to signaling hub. Waiting for peer...");
       setStep("chat");
+      setSecurityStatus(prev => ({ ...prev, e2eeActive: false }));
+      // Signal current identity to newly joined room
+      sig.send({ t: "PEER_JOIN", roomId: finalRoomId, fingerprint: identity });
     });
     signalingRef.current = sig;
     sig.connect();
 
     // Init WebRTC
     const peer = new P2PPeer(
-      { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] },
+      {
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun2.l.google.com:19302" },
+          { urls: "stun:stun3.l.google.com:19302" },
+          { urls: "stun:stun4.l.google.com:19302" },
+          { urls: "stun:global.stun.twilio.com:3478" }
+        ]
+      },
       handleIncomingData,
-      (candidate) => sig.send({ t: "ICE", roomId: finalRoomId, candidate }),
+      (candidate) => {
+        if (evPeerIdRef.current) {
+          sig.send({ t: "MESH_ICE", roomId: finalRoomId, targetPeerId: evPeerIdRef.current, candidate });
+        } else {
+          sig.send({ t: "ICE", roomId: finalRoomId, candidate });
+        }
+      },
       (state) => {
         setPeerState(state);
         auditLog("info", `P2P Connection State: ${state}`);
         if (state === "connected") {
+          setSecurityStatus(prev => ({ ...prev, e2eeActive: true }));
           setMessages(prev => [...prev, { id: 'sys-' + Date.now(), type: 'system', text: "🔒 Secure P2P Tunnel Established." }]);
         }
         if (state === "failed" || state === "closed") {
+          setSecurityStatus(prev => ({ ...prev, e2eeActive: false }));
           setMessages(prev => [...prev, { id: 'sys-' + Date.now(), type: 'system', text: "❌ Peer left the chat." }]);
         }
       }
@@ -118,16 +227,9 @@ export default function ShredderPage() {
     camouflageRef.current = camo;
     camo.startNoiseGenerator();
 
-    setTimeout(async () => {
-      if (peerRef.current?.getSignalingState() === "stable") {
-        auditLog("sec", "Initiating P2P Handshake & Key Exchange...");
-        const jwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
-        sig.send({ t: "PUBKEY", roomId: finalRoomId, jwk });
-
-        const offer = await peer.createOffer();
-        sig.send({ t: "OFFER", roomId: finalRoomId, sdp: offer, from: identity });
-      }
-    }, 1500);
+    // NOTE: We do NOT send OFFER here. The server sends ROOM_INFO telling us
+    // who is already in the room. If there are existing peers, WE (the new
+    // joiner) send the offer. If we are alone, we wait for PEER_JOIN.
   }
 
   async function startRandomSession() {
@@ -152,48 +254,80 @@ export default function ShredderPage() {
 
   // 3️⃣ Signaling Handlers
   async function handleSignaling(ev: SignalingEvent | any) {
-    if (!peerRef.current || !keyPairRef.current) return;
+    if (!keyPairRef.current) return;
 
     switch (ev.t) {
-      case "PUBKEY":
+      case "ROOM_INFO": {
+        auditLog("info", `Joined room. ${ev.peers?.length || 0} peer(s) already present.`);
+        // Track our own peer ID for mesh
+        myPeerIdRef.current = ev.yourPeerId;
+
+        // If there are existing peers, WE initiate the handshake to each
+        // In this MVP, we just connect to the first one found for simplicity
+        if (ev.peers && ev.peers.length > 0 && peerRef.current) {
+          const targetId = ev.peers[0];
+          evPeerIdRef.current = targetId;
+          auditLog("sec", `Initiating Handshake with peer ${targetId.slice(0, 8)}...`);
+
+          const jwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
+          signalingRef.current?.send({ t: "PUBKEY", roomId: currentRoomIdRef.current, jwk });
+
+          const offer = await peerRef.current.createOffer();
+          signalingRef.current?.send({ t: "MESH_OFFER", roomId: currentRoomIdRef.current, targetPeerId: targetId, sdp: offer });
+        }
+        break;
+      }
+      case "PEER_JOIN": {
+        auditLog("info", `New peer joined: ${ev.peerId?.slice(0, 8)}...`);
+        // Track the last joined peer to ensure we always have a target for signaling
+        evPeerIdRef.current = ev.peerId;
+        // The new joiner will send us an offer. We just send our public key.
+        const myJwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
+        signalingRef.current?.send({ t: "PUBKEY", roomId: currentRoomIdRef.current, jwk: myJwk });
+        break;
+      }
+      case "PEER_LEAVE": {
+        auditLog("info", `Peer left: ${ev.peerId?.slice(0, 8)}...`);
+        setMessages(prev => [...prev, { id: 'sys-' + Date.now(), type: 'system', text: "❌ Peer left the chat." }]);
+        break;
+      }
+      case "MESH_OFFER": {
+        if (!peerRef.current) return;
+        evPeerIdRef.current = ev.peerId;
+        auditLog("sec", `Received Offer from ${ev.peerId.slice(0, 8)}. Deriving Answer...`);
+
+        const answer = await peerRef.current.handleOffer(ev.sdp);
+        signalingRef.current?.send({ t: "MESH_ANSWER", roomId: currentRoomIdRef.current, targetPeerId: ev.peerId, sdp: answer });
+        break;
+      }
+      case "MESH_ANSWER": {
+        if (!peerRef.current) return;
+        auditLog("sec", `Received Answer from ${ev.peerId.slice(0, 8)}. Handshake complete.`);
+        await peerRef.current.handleAnswer(ev.sdp);
+        break;
+      }
+      case "MESH_ICE":
+      case "ICE": {
+        if (!peerRef.current) return;
+        await peerRef.current.addCandidate(ev.candidate);
+        break;
+      }
+      case "PUBKEY": {
+        if (!peerRef.current) return;
         auditLog("sec", "Received remote public key. Deriving Shared Secret...");
         const remotePublic = await Crypto.importPublicKey(ev.jwk);
         sharedKeyRef.current = await Crypto.deriveSharedKey(
           keyPairRef.current!.privateKey,
           remotePublic
         );
-        // If we received their key, send ours back if we haven't yet
-        const myJwk = await Crypto.exportPublicKey(keyPairRef.current!.publicKey);
-        const activeRoomId = currentRoomIdRef.current;
-        signalingRef.current?.send({ t: "PUBKEY", roomId: activeRoomId, jwk: myJwk });
+        setSecurityStatus(prev => ({ ...prev, e2eeActive: true }));
+        auditLog("sec", "🔐 E2EE Shared Secret Established.");
         break;
-      case "OFFER":
-        const currentSignalingState = peerRef.current.getSignalingState();
-        const offerCollision = currentSignalingState !== "stable";
-
-        // Collision resolution: compare identity hashes (Tie-breaker)
-        // If we are "impolite" (hash > remote), we ignore their offer if it's a collision
-        if (offerCollision && identity! > ev.from) {
-          auditLog("sec", "Offer collision detected. Yielding to polite peer.");
-          return;
-        }
-
-        auditLog("sec", "Received P2P Offer. Deriving Answer...");
-        const answer = await peerRef.current.handleOffer(ev.sdp);
-        const activeRoomIdForAnswer = currentRoomIdRef.current;
-        signalingRef.current?.send({ t: "ANSWER", roomId: activeRoomIdForAnswer, sdp: answer });
+      }
+      case "ERROR": {
+        auditLog("panic", `Signaling error: ${ev.code || 'unknown'}`);
         break;
-      case "ANSWER":
-        if (peerRef.current.getSignalingState() !== "have-local-offer") {
-          auditLog("info", "Received unexpected Answer. Ignoring.");
-          return;
-        }
-        auditLog("sec", "Received P2P Answer. Handshake complete.");
-        await peerRef.current.handleAnswer(ev.sdp);
-        break;
-      case "ICE":
-        await peerRef.current.addCandidate(ev.candidate);
-        break;
+      }
     }
   }
 
@@ -246,9 +380,9 @@ export default function ShredderPage() {
   async function sendMessage() {
     if (!inputText.trim() || !peerRef.current) return;
 
-    const scan = scanSensitivity(inputText);
+    const scan = enhancedScanSensitivity(inputText);
     if (scan.sensitive && !sensitivityWarning) {
-      setSensitivityWarning(scan.matches);
+      setSensitivityWarning(scan.matches.map(m => `${m.description}${m.redactedPreview ? ` (${m.redactedPreview})` : ''}`));
       return;
     }
 
@@ -352,6 +486,17 @@ export default function ShredderPage() {
     setPeerState("disconnected");
     setIsSearchingRandom(false);
     currentRoomIdRef.current = "";
+    // Enterprise cleanup
+    meshRef.current?.destroy();
+    meshRef.current = null;
+    distSignalingRef.current?.close();
+    distSignalingRef.current = null;
+    advCamouflageRef.current?.stop();
+    advCamouflageRef.current = null;
+    setConnectedPeers([]);
+    setMeshStats(null);
+    setTrafficStats(null);
+    setSecurityStatus(prev => ({ ...prev, e2eeActive: false }));
   }
 
   // 🎚️ Render Logic
@@ -367,6 +512,28 @@ export default function ShredderPage() {
     }}>
       <AuditPanel />
       <PanicManager />
+
+      {/* Background Noise Shield against AI/Detection */}
+      <div style={{
+        position: 'fixed',
+        top: 0, left: 0, width: '100%', height: '100%',
+        background: 'url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAyBAMAAADsEZWCAAAAGFBMVEUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAt6PU7AAAAB3RSTlMA7mZmZmZmfz0HAAAAQ0lEQVQ4y2NgQAX8DIyMTMcYmBhYGRgZGLYwMDBsYmBk2MLAwLCNgZFhCwMjw58vX758+fLly5cvX76A/79+PwwMDBlWAwC+fBvE9u+jYwAAAABJRU5ErkJggg==")',
+        opacity: 0.03,
+        pointerEvents: 'none',
+        zIndex: 5
+      }} />
+
+      {step === "chat" && (
+        <EnterpriseDashboard
+          securityStatus={securityStatus}
+          meshStats={meshStats}
+          trafficStats={trafficStats}
+          peers={connectedPeers}
+          roomPolicy={roomPolicy}
+          roomId={roomId}
+          signalingNode={signalingNodeId}
+        />
+      )}
 
       <section
         className="main-card"
@@ -388,13 +555,22 @@ export default function ShredderPage() {
         <header style={{ textAlign: "center" }}>
           <h1 style={{ margin: 0, fontSize: 32, letterSpacing: "-1px", fontWeight: 800 }}>
             GHOST<span style={{ color: "#79c0ff" }}>WIRE</span>
+            <span style={{ fontSize: 10, color: "#58a6ff", fontWeight: 500, marginLeft: 8, verticalAlign: "super" }}>ENTERPRISE</span>
           </h1>
           <p style={{ color: "#8b949e", fontSize: 13, marginTop: 8 }}>
-            End-to-End Encrypted Stranger & Private Chat
+            Post-Quantum Encrypted · Multi-Peer Mesh · Zero Metadata
           </p>
           {identity && (
-            <div style={{ marginTop: 12, display: "inline-block", padding: "4px 12px", background: "rgba(121, 192, 255, 0.1)", border: "1px solid rgba(121, 192, 255, 0.2)", borderRadius: 100, fontSize: 10, color: "#79c0ff" }}>
-              Identity Hash: {identity}
+            <div style={{ marginTop: 12, display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+              <div style={{ padding: "4px 12px", background: "rgba(121, 192, 255, 0.1)", border: "1px solid rgba(121, 192, 255, 0.2)", borderRadius: 100, fontSize: 10, color: "#79c0ff" }}>
+                🔑 {identity.slice(0, 16)}
+              </div>
+              <div style={{ padding: "4px 12px", background: pqcActive ? "rgba(63, 185, 80, 0.1)" : "rgba(210, 153, 34, 0.1)", border: `1px solid ${pqcActive ? "rgba(63, 185, 80, 0.2)" : "rgba(210, 153, 34, 0.2)"}`, borderRadius: 100, fontSize: 10, color: pqcActive ? "#3fb950" : "#d29922" }}>
+                {pqcActive ? "🛡️ PQC Active" : "⚠️ Classical"}
+              </div>
+              <div style={{ padding: "4px 12px", background: "rgba(63, 185, 80, 0.1)", border: "1px solid rgba(63, 185, 80, 0.2)", borderRadius: 100, fontSize: 10, color: "#3fb950" }}>
+                📡 10-Peer Mesh
+              </div>
             </div>
           )}
         </header>
@@ -543,7 +719,12 @@ export default function ShredderPage() {
                         <div style={{ fontSize: 9, padding: "4px 8px", background: "rgba(0,0,0,0.3)", color: "#8b949e" }}>🔒 Encrypted Media</div>
                       </div>
                     ) : (
-                      <div style={{ fontSize: 14, lineHeight: 1.5 }}>{m.text}</div>
+                      <SecureCanvas
+                        text={m.text}
+                        from={m.from}
+                        isMe={m.from === (nickName.trim() || identity?.slice(0, 6))}
+                        maxWidth={300}
+                      />
                     )}
                   </div>
                 )

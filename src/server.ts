@@ -64,9 +64,11 @@ export async function buildServer() {
     disableRequestLogging: !config.LOG_REQUESTS
   };
 
-  // Enable HTTPS if certificates are present (common for local dev)
+  // Enable HTTPS if certificates are present and we are NOT in development
+  // In dev, we let the proxy (Next.js/Cloudflare) handle SSL termination
   const certDir = path.join(process.cwd(), "server", "certs");
-  if (fs.existsSync(path.join(certDir, "key.pem")) && fs.existsSync(path.join(certDir, "cert.pem"))) {
+  const isDev = config.NODE_ENV === "development";
+  if (!isDev && fs.existsSync(path.join(certDir, "key.pem")) && fs.existsSync(path.join(certDir, "cert.pem"))) {
     fastifyOpts.https = {
       key: fs.readFileSync(path.join(certDir, "key.pem")),
       cert: fs.readFileSync(path.join(certDir, "cert.pem"))

@@ -35,6 +35,23 @@ export function registerSecurityHeaders(fastify: any) {
         // Referrer policy (don't leak referrer to external sites)
         reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
 
+        // Cross-Origin Opener Policy (COOP) - Isolate browsing context
+        reply.header("Cross-Origin-Opener-Policy", "same-origin");
+
+        // Cross-Origin Embedder Policy (COEP) - Require CORP/CORS
+        reply.header("Cross-Origin-Embedder-Policy", "require-corp");
+
+        // Cross-Origin Resource Policy (CORP) - Prevent cross-origin reads
+        reply.header("Cross-Origin-Resource-Policy", "same-origin");
+
+        // Prevent page from being loaded in iframes (iframe isolation)
+        reply.header("X-Frame-Options", "DENY");
+
+        // Cache-Control for sensitive pages
+        reply.header("Cache-Control", "no-store, no-cache, must-revalidate, private");
+        reply.header("Pragma", "no-cache");
+        reply.header("Expires", "0");
+
         // Remove server identification
         reply.removeHeader("X-Powered-By");
         reply.removeHeader("Server");

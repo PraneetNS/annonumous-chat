@@ -8,11 +8,15 @@ const nextConfig = {
         return [
             {
                 source: "/api/:path*",
-                destination: "https://127.0.0.1:3001/:path*", // Proxy to Backend
+                destination: "http://127.0.0.1:3001/:path*", // Proxy to Backend
             },
             {
                 source: "/ws",
-                destination: "https://127.0.0.1:3001/ws", // Proxy WebSocket
+                destination: "http://127.0.0.1:3001/ws", // Proxy WebSocket
+            },
+            {
+                source: "/signaling",
+                destination: "http://127.0.0.1:3001/signaling", // Proxy Signaling
             },
         ];
     },
