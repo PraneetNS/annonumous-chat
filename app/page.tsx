@@ -92,7 +92,7 @@ export default function ShredderPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // 1️⃣ Initialize Session Identity + Enterprise Modules
+  // 1️⃣ Initialize Session Identity + Enterprise Modules (ONCE)
   useEffect(() => {
     async function init() {
       auditLog("info", "Initializing GhostWire Enterprise engine...");
@@ -121,27 +121,17 @@ export default function ShredderPage() {
         devToolsDetection: true,
         autoWipeOnDetection: true,
         onThreatDetected: (threat) => {
-          auditLog("panic", `THRÉAT DETECTED: ${threat.details}`);
+          auditLog("panic", `THREAT DETECTED: ${threat.details}`);
         }
       });
       screenProt.activate();
       screenProtRef.current = screenProt;
       setSecurityStatus(prev => ({ ...prev, screenProtection: true }));
-      auditLog("sec", "📸 Screen Protection Active (Auto-Wipe Enabled)");
+      auditLog("sec", "📸 Screen Protection Active");
     }
     init();
 
-    // Keep connection fresh
-    const connCheck = setInterval(() => {
-      if (peerRef.current && peerState !== "connected" && step === "chat") {
-        auditLog("info", "Retrying P2P handshake...");
-        // If stuck, restart gathering
-        startSession(currentRoomIdRef.current || "");
-      }
-    }, 30000);
-
     return () => {
-      clearInterval(connCheck);
       // Emergency Cleanup on unmount
       peerRef.current?.wipe();
       signalingRef.current?.close();
@@ -153,7 +143,7 @@ export default function ShredderPage() {
       if (pqcBundleRef.current) wipePQCBundle(pqcBundleRef.current);
       revokeAllMedia();
     };
-  }, [step]); // Re-run if we move to chat step to start listener
+  }, []); // Only run ONCE on mount
 
   function revokeAllMedia() {
     for (const url of objectUrlsRef.current) {
@@ -179,8 +169,7 @@ export default function ShredderPage() {
       auditLog("info", "Connected to signaling hub. Waiting for peer...");
       setStep("chat");
       setSecurityStatus(prev => ({ ...prev, e2eeActive: false }));
-      // Signal current identity to newly joined room
-      sig.send({ t: "PEER_JOIN", roomId: finalRoomId, fingerprint: identity });
+      // Do NOT send PEER_JOIN manually — the server handles that via JOIN event
     });
     signalingRef.current = sig;
     sig.connect();
