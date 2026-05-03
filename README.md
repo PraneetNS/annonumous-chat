@@ -75,5 +75,3 @@ npm run dev:all
 
 ---
 
-### 🚨 SECURITY WARNING 🚨
-*This software is experimental. In high-risk situations, always combine Digital Shredder with a trusted VPN and a hardened OS (like Tails or Qubes OS). Use at your own risk.*
