@@ -66,12 +66,5 @@ npm run dev:all
 1.  Expose the signaling server via HTTPS (HTTPS is **REQUIRED** for WebCrypto).
 2.  Use a STUN/TURN server for P2P connectivity across restricted NATs.
 
----
-
-## 🛠 Future Research
-- **VDF Time-Locks**: Integrating Verifiable Delay Functions for mathematical time-locked decryption.
-- **Post-Quantum Crypto**: Transitioning to Kyber/Dilithium for PQC resistance.
-- **steganographic fallbacks**: Hiding signaling data inside common image/pixel formats.
-
----
+--
 
